@@ -20,6 +20,10 @@ depends: []
 #include "thread.hpp"
 #include "transform.hpp"
 
+#if defined(__riscv)
+#include "sg200x_ll_csr.h"
+#endif
+
 #define BMI088_REG_ACCL_CHIP_ID (0x00)
 #define BMI088_REG_ACCL_ERR (0x02)
 #define BMI088_REG_ACCL_STATUS (0x03)
@@ -164,8 +168,35 @@ class BMI088
    * @param device 目标传感器。
    *               Target sensor.
    */
+  static inline void CsFence()
+  {
+#if defined(__riscv)
+    sg200x_ll_csr_fence_io();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+  }
+
+  static inline void CsDelay()
+  {
+#if defined(__riscv)
+    sg200x_ll_csr_delay_nops(1024u);
+#else
+    for (volatile uint32_t i = 0u; i < 1024u; ++i)
+    {
+    }
+#endif
+  }
+
   void Select(Device device)
   {
+    /* LibXR SPI is CS-agnostic: this driver owns both chip selects.
+     * Fixed deassert/setup delays, no GPIO polling. */
+    cs_accl_->Write(true);
+    cs_gyro_->Write(true);
+    CsFence();
+    CsDelay();
+
     if (device == Device::ACCELMETER)
     {
       cs_accl_->Write(false);
@@ -174,6 +205,8 @@ class BMI088
     {
       cs_gyro_->Write(false);
     }
+    CsFence();
+    CsDelay();
   }
 
   /**
@@ -183,16 +216,12 @@ class BMI088
    * @param device 目标传感器。
    *               Target sensor.
    */
-  void Deselect(Device device)
+  void Deselect(Device)
   {
-    if (device == Device::ACCELMETER)
-    {
-      cs_accl_->Write(true);
-    }
-    else
-    {
-      cs_gyro_->Write(true);
-    }
+    cs_accl_->Write(true);
+    cs_gyro_->Write(true);
+    CsFence();
+    CsDelay();
   }
 
   /**
@@ -372,7 +401,7 @@ class BMI088
         },
         this);
 
-    int_gyro_->SetConfig({.direction = LibXR::GPIO::Direction::FALL_INTERRUPT,
+    int_gyro_->SetConfig({.direction = LibXR::GPIO::Direction::LOW_LEVEL_INTERRUPT,
                           .pull = LibXR::GPIO::Pull::NONE});
 
     int_gyro_->RegisterCallback(gyro_int_cb);
@@ -456,14 +485,12 @@ class BMI088
     WriteSingle(Device::GYROSCOPE, BMI088_REG_GYRO_BANDWIDTH,
                 static_cast<uint8_t>(gyro_freq_));
 
-    /* INT3 and INT4 as output. Push-pull. Active low. */
-    WriteSingle(Device::GYROSCOPE, BMI088_REG_GYRO_INT3_INT4_IO_CONF, 0x00);
-
-    /* Map data ready interrupt to INT3. */
-    WriteSingle(Device::GYROSCOPE, BMI088_REG_GYRO_INT3_INT4_IO_MAP, 0x01);
-
-    /* Enable new data interrupt. */
-    WriteSingle(Device::GYROSCOPE, BMI088_REG_GYRO_INT_CTRL, 0x80);
+    /* Fixed INT2/INT3 tie: INT3 input/high-Z. */
+    WriteSingle(Device::GYROSCOPE, BMI088_REG_GYRO_INT3_INT4_IO_CONF, 0x04);
+    WriteSingle(Device::GYROSCOPE, BMI088_REG_GYRO_INT_CTRL, 0x00);
+    WriteSingle(Device::ACCELMETER, BMI088_REG_ACCL_INT1_IO_CONF, 0x08);
+    WriteSingle(Device::ACCELMETER, BMI088_REG_ACCL_INT2_IO_CONF, 0x00);
+    WriteSingle(Device::ACCELMETER, BMI088_REG_ACCL_INT1_INT2_MAP_DATA, 0x04);
 
     LibXR::Thread::Sleep(50);
     int_gyro_->EnableInterrupt();
@@ -556,6 +583,16 @@ class BMI088
       }
       else
       {
+        static uint32_t timeout_count = 0u;
+        ++timeout_count;
+        if ((timeout_count % 20u) == 1u)
+        {
+          XR_LOG_WARN("BMI088 TO n=%u a24=%d a22=%d a23=%d",
+                      static_cast<unsigned>(timeout_count),
+                      bmi088->int_gyro_->Read() ? 1 : 0,
+                      bmi088->cs_accl_->Read() ? 1 : 0,
+                      bmi088->cs_gyro_->Read() ? 1 : 0);
+        }
         XR_LOG_WARN("BMI088 wait timeout.");
       }
     }
