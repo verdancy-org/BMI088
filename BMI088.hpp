@@ -347,7 +347,11 @@ class BMI088
         pwm_(std::addressof(heater_pwm)),
         rotation_(std::move(param.rotation)),
         pid_heat_(param.pid_param),
-        op_spi_(sem_spi_),
+        // Bound the transfer wait to 20 ms (~570x the 35 us wire time). The
+        // default UINT32_MAX never expires once the scheduler tick is stopped,
+        // so a one-frame SSI termination would stall this thread forever and
+        // compound the freeze (doc imu-link walkthrough section 18.4).
+        op_spi_(sem_spi_, 20u),
         cmd_file_(LibXR::RamFS::CreateFile("bmi088", CommandFunc, this)),
         gyro_data_key_(database, "bmi088_gyro_data",
                        Eigen::Matrix<float, 3, 1>(0.0, 0.0, 0.0))
@@ -529,6 +533,16 @@ class BMI088
   {
     while (true)
     {
+#ifndef SG200X_GPIO_IRQ_DIAG
+      // Re-arm the gyro INT3 interrupt before each wait. CheckInterrupt masks
+      // the pin after every dispatch to bound do_irq's re-entry on the
+      // level-triggered source, so the line must be unmasked here or the next
+      // data-ready pulse never fires and the IMU reads exactly once.
+      // EnableInterrupt() also clears a latch left by a pulse that arrived
+      // while masked; with the line still at its active level that pulse
+      // re-asserts immediately, so no sample is lost.
+      bmi088->int_gyro_->EnableInterrupt();
+#endif
       if (bmi088->new_data_.Wait(50) == LibXR::ErrorCode::OK)
       {
         const auto sample_timestamp = bmi088->sample_timestamp_;
